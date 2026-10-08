@@ -1,0 +1,2 @@
+RMAN-08137: warning: archived log not deleted, needed for standby or upstream capture process
+archived log file name=/u01/arch/1_123_1153000000.dbf thread=1 sequence=123

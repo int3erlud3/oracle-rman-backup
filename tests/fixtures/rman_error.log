@@ -1,0 +1,6 @@
+RMAN-03009: failure of backup command on d1 channel at 10/08/2026 02:00:13
+ORA-19502: write error on file "/u02/backup/FREE/FREE_20261008_0a2b3c4d_1_1", block number 1048576 (block size=8192)
+ORA-27072: File I/O error
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================

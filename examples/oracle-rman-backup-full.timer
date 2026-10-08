@@ -1,0 +1,13 @@
+# /etc/systemd/system/oracle-rman-backup-full.timer
+# Weekly level 0 on Sunday 01:00; pair with a daily "incr" and an hourly "arch" timer.
+[Unit]
+Description=Weekly RMAN level 0 backup
+
+[Timer]
+Unit=oracle-rman-backup@full.service
+OnCalendar=Sun *-*-* 01:00:00
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

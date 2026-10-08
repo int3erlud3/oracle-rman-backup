@@ -1,0 +1,424 @@
+#!/usr/bin/env bash
+# oracle-rman-backup - RMAN wrapper for full / incremental / archivelog backups,
+# retention maintenance, VALIDATE and restore preview.
+#
+# Connects with OS authentication ("CONNECT TARGET /") as the Oracle software owner;
+# no passwords are used, accepted or written anywhere. The generated RMAN script is
+# printed with --dry-run.
+set -euo pipefail
+umask 077
+
+readonly VERSION="1.0.0"
+readonly PROG="${0##*/}"
+
+# Exit codes (Nagios/Icinga compatible)
+readonly E_OK=0 E_WARN=1 E_CRIT=2 E_UNKNOWN=3
+
+# ---- defaults ----------------------------------------------------------------
+ACTION=""
+SID="${ORACLE_SID:-}"
+OHOME="${ORACLE_HOME:-}"
+DEST=""
+CHANNELS=1
+COMPRESS=0
+SECTION_SIZE=""
+TAG=""
+CUMULATIVE=0
+DELETE_INPUT=0
+DELETE=0
+RETENTION_DAYS=""
+REDUNDANCY=""
+CATALOG_ALIAS=""
+LOG_DIR=""
+LOCK_FILE=""
+LOG_KEEP_DAYS=30
+MAX_RUNTIME=""
+DRY_RUN=0
+CHECK_SYNTAX=0
+FORMAT="text"
+SHOW_BANNER=1
+
+# ---- banner (cosmetic: stderr only, interactive terminals only) -----------
+# Bastion Ops Toolkit banner. Disable with --no-banner or NO_BANNER=1. Not shown when
+# stderr is not a terminal (cron, pipes, systemd, monitoring agents).
+banner_enabled() {
+  (( SHOW_BANNER )) || return 1
+  [[ -z ${NO_BANNER:-} || ${NO_BANNER} == 0 ]] || return 1
+  [[ -t 2 ]]
+}
+
+print_banner() {
+  banner_enabled || return 0
+  {
+    cat <<'WORDMARK'
+                   _
+   ___ _ _ __ _ __| |___ ___ _ _ _ __  __ _ _ _
+  / _ \ '_/ _` / _| / -_)___| '_| '  \/ _` | ' \
+  \___/_| \__,_\__|_\___|   |_| |_|_|_\__,_|_||_|
+   _             _
+  | |__  __ _ __| |___  _ _ __
+  | '_ \/ _` / _| / / || | '_ \
+  |_.__/\__,_\__|_\_\\_,_| .__/
+                         |_|
+
++====================================================================+
+|  ORACLE RMAN BACKUP  ::  Backup, Retention & Validation            |
++--------------------------------------------------------------------+
+|  Full/incremental/archivelog backups with dry-run and exit codes   |
+WORDMARK
+    printf '|  %-64s  |\n' "v$VERSION  -  Bastion Ops Toolkit  -  by int3erlud3"
+    printf '%s\n\n' '+====================================================================+'
+  } >&2 || true
+}
+
+usage() {
+  cat <<USAGE
+Usage: $PROG ACTION [options]
+
+Actions:
+  full          incremental level 0 database backup + archivelogs + controlfile + spfile
+  incr          incremental level 1 backup (differential; --cumulative for cumulative)
+  arch          back up archived redo logs not yet backed up
+  validate      BACKUP VALIDATE CHECK LOGICAL of database and archivelogs (no backup written)
+  restore-check RESTORE DATABASE VALIDATE: prove the backups needed for a restore are usable
+  preview       RESTORE DATABASE PREVIEW SUMMARY: list the backups a restore would use
+  maintenance   crosscheck + report obsolete/expired; deletes only with --delete
+
+Options:
+  --sid SID              ORACLE_SID (default: \$ORACLE_SID)
+  --oracle-home DIR      ORACLE_HOME (default: \$ORACLE_HOME)
+  --dest DIR             backup piece directory (default: configured channel / FRA)
+  --channels N           parallel disk channels, 1-16 (default 1)
+  --compress             AS COMPRESSED BACKUPSET
+  --section-size SIZE    multisection backups, e.g. 32G
+  --tag TAG              backup tag (default ACTION_YYYYMMDDTHHMMSS)
+  --cumulative           cumulative level 1 (incr only)
+  --delete-input         delete archivelogs after they were backed up (full/incr/arch)
+  --retention-days N     recovery window for maintenance (default 7)
+  --redundancy N         keep N backups instead of a recovery window
+  --delete               maintenance: DELETE EXPIRED and OBSOLETE backups
+  --catalog-alias ALIAS  connect to a recovery catalog via wallet alias (CONNECT CATALOG /@ALIAS)
+  --log-dir DIR          log directory (default \$ORACLE_BASE/admin/SID/rman_logs or ~/rman_logs)
+  --lock-file FILE       lock file (default LOG_DIR/.oracle-rman-backup-SID.lock)
+  --log-keep-days N      remove own log files older than N days (default 30, 0 = never)
+  --max-runtime MIN      abort RMAN after MIN minutes
+  --dry-run              print the generated RMAN script and exit
+  --check-syntax         run "rman checksyntax" on the generated script and exit
+  --format text|json     summary format on stdout (default text)
+  --no-banner            do not print the banner (or set NO_BANNER=1)
+  -h, --help             show this help
+  -V, --version          show version
+
+Exit codes: 0 OK, 1 WARNING, 2 CRITICAL (RMAN failed / corruption), 3 UNKNOWN (usage,
+configuration or lock error).
+USAGE
+}
+
+die() {
+  printf '%s: error: %s\n' "$PROG" "$1" >&2
+  exit "${2:-$E_UNKNOWN}"
+}
+
+json_str() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\r'/}
+  printf '"%s"' "$(printf '%s' "$s" | tr -d '\000-\010\013-\037')"
+}
+
+need_arg() { [[ $# -ge 2 && -n $2 ]] || die "option $1 requires an argument"; }
+
+posint() { # name value min max
+  if [[ ! $2 =~ ^[0-9]{1,6}$ ]] || (( 10#$2 < $3 || 10#$2 > $4 )); then
+    die "$1 must be an integer between $3 and $4"
+  fi
+}
+
+parse_args() {
+  for arg in "$@"; do
+    [[ $arg == --no-banner ]] && SHOW_BANNER=0
+  done
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      full | incr | arch | validate | restore-check | preview | maintenance)
+        [[ -z $ACTION ]] || die "only one action allowed"
+        ACTION=$1 ;;
+      --sid) need_arg "$@"; SID=$2; shift ;;
+      --oracle-home) need_arg "$@"; OHOME=$2; shift ;;
+      --dest) need_arg "$@"; DEST=$2; shift ;;
+      --channels) need_arg "$@"; CHANNELS=$2; shift ;;
+      --compress) COMPRESS=1 ;;
+      --section-size) need_arg "$@"; SECTION_SIZE=$2; shift ;;
+      --tag) need_arg "$@"; TAG=$2; shift ;;
+      --cumulative) CUMULATIVE=1 ;;
+      --delete-input) DELETE_INPUT=1 ;;
+      --retention-days) need_arg "$@"; RETENTION_DAYS=$2; shift ;;
+      --redundancy) need_arg "$@"; REDUNDANCY=$2; shift ;;
+      --delete) DELETE=1 ;;
+      --catalog-alias) need_arg "$@"; CATALOG_ALIAS=$2; shift ;;
+      --log-dir) need_arg "$@"; LOG_DIR=$2; shift ;;
+      --lock-file) need_arg "$@"; LOCK_FILE=$2; shift ;;
+      --log-keep-days) need_arg "$@"; LOG_KEEP_DAYS=$2; shift ;;
+      --max-runtime) need_arg "$@"; MAX_RUNTIME=$2; shift ;;
+      --dry-run) DRY_RUN=1 ;;
+      --check-syntax) CHECK_SYNTAX=1 ;;
+      --format) need_arg "$@"; FORMAT=$2; shift ;;
+      --no-banner) SHOW_BANNER=0 ;;
+      -h | --help) print_banner; usage; exit "$E_OK" ;;
+      -V | --version) print_banner; printf '%s %s\n' "$PROG" "$VERSION"; exit "$E_OK" ;;
+      *) usage >&2; die "unknown argument: $1" ;;
+    esac
+    shift
+  done
+}
+
+validate_args() {
+  [[ -n $ACTION ]] || { usage >&2; die "no action given"; }
+  [[ $FORMAT == text || $FORMAT == json ]] || die "--format must be text or json"
+  [[ $SID =~ ^[A-Za-z][A-Za-z0-9_]{0,29}$ ]] || die "invalid or missing ORACLE_SID (use --sid)"
+  posint --channels "$CHANNELS" 1 16
+  posint --log-keep-days "$LOG_KEEP_DAYS" 0 3650
+  [[ -z $MAX_RUNTIME ]] || posint --max-runtime "$MAX_RUNTIME" 1 10080
+  [[ -z $SECTION_SIZE || $SECTION_SIZE =~ ^[1-9][0-9]{0,5}[MG]$ ]] || die "--section-size must look like 512M or 32G"
+  [[ -z $TAG || $TAG =~ ^[A-Za-z][A-Za-z0-9_]{0,25}$ ]] || die "--tag: letters, digits and _ only (max 26)"
+  [[ -z $CATALOG_ALIAS || $CATALOG_ALIAS =~ ^[A-Za-z][A-Za-z0-9_.-]{0,63}$ ]] || die "invalid --catalog-alias"
+  if [[ -n $DEST ]]; then
+    # Strict whitelist: the value is embedded in a quoted RMAN FORMAT string.
+    [[ $DEST =~ ^/[A-Za-z0-9._/+-]*$ && $DEST != *..* ]] || die "--dest must be an absolute path (A-Z a-z 0-9 . _ / + -)"
+    DEST=${DEST%/}
+  fi
+  if [[ -n $RETENTION_DAYS && -n $REDUNDANCY ]]; then
+    die "use either --retention-days or --redundancy"
+  fi
+  [[ -z $RETENTION_DAYS ]] || posint --retention-days "$RETENTION_DAYS" 1 3650
+  [[ -z $REDUNDANCY ]] || posint --redundancy "$REDUNDANCY" 1 100
+  [[ -n $RETENTION_DAYS || -n $REDUNDANCY ]] || RETENTION_DAYS=7
+  (( ! CUMULATIVE )) || [[ $ACTION == incr ]] || die "--cumulative is only valid for incr"
+  (( ! DELETE )) || [[ $ACTION == maintenance ]] || die "--delete is only valid for maintenance"
+  if (( DELETE_INPUT )); then
+    [[ $ACTION == full || $ACTION == incr || $ACTION == arch ]] || die "--delete-input is only valid for full, incr and arch"
+  fi
+  [[ -n $TAG ]] || TAG="$(printf '%s' "$ACTION" | tr '[:lower:]-' '[:upper:]_')_$(date +%Y%m%dT%H%M%S)"
+  return 0
+}
+
+# ---- RMAN script generation ----------------------------------------------------
+retention_clause() {
+  if [[ -n $REDUNDANCY ]]; then
+    printf 'REDUNDANCY %s' "$REDUNDANCY"
+  else
+    printf 'RECOVERY WINDOW OF %s DAYS' "$RETENTION_DAYS"
+  fi
+}
+
+channels_block() {
+  local i fmt=""
+  [[ -z $DEST ]] || fmt=" FORMAT '$DEST/%d_%T_%U'"
+  for ((i = 1; i <= CHANNELS; i++)); do
+    printf "  ALLOCATE CHANNEL d%d DEVICE TYPE DISK%s;\n" "$i" "$fmt"
+  done
+}
+
+backup_opts() {
+  local o="BACKUP"
+  (( COMPRESS )) && o+=" AS COMPRESSED BACKUPSET"
+  printf '%s' "$o"
+}
+
+archivelog_backup() {
+  local del=""
+  (( DELETE_INPUT )) && del=" DELETE INPUT"
+  printf '  ALTER SYSTEM ARCHIVE LOG CURRENT;\n'
+  printf "  %s ARCHIVELOG ALL NOT BACKED UP 1 TIMES TAG '%s_ARC'%s;\n" "$(backup_opts)" "$TAG" "$del"
+}
+
+generate_script() {
+  local section=""
+  [[ -z $SECTION_SIZE ]] || section=" SECTION SIZE $SECTION_SIZE"
+  printf '# generated by %s %s - action %s, SID %s\n' "$PROG" "$VERSION" "$ACTION" "$SID"
+  printf 'CONNECT TARGET /\n'
+  [[ -z $CATALOG_ALIAS ]] || printf 'CONNECT CATALOG /@%s\n' "$CATALOG_ALIAS"
+  printf 'SET ECHO ON;\n'
+  case $ACTION in
+    full | incr)
+      local level="INCREMENTAL LEVEL 0"
+      if [[ $ACTION == incr ]]; then
+        level="INCREMENTAL LEVEL 1"
+        (( CUMULATIVE )) && level+=" CUMULATIVE"
+      fi
+      printf 'RUN {\n'
+      channels_block
+      printf "  %s %s%s DATABASE TAG '%s';\n" "$(backup_opts)" "$level" "$section" "$TAG"
+      archivelog_backup
+      printf "  BACKUP CURRENT CONTROLFILE TAG '%s_CTL';\n" "$TAG"
+      printf "  BACKUP SPFILE TAG '%s_SPF';\n" "$TAG"
+      printf '}\n'
+      ;;
+    arch)
+      printf 'RUN {\n'
+      channels_block
+      archivelog_backup
+      printf '}\n'
+      ;;
+    validate)
+      printf 'RUN {\n'
+      channels_block
+      printf '  BACKUP VALIDATE CHECK LOGICAL%s DATABASE ARCHIVELOG ALL;\n' "$section"
+      printf '}\n'
+      ;;
+    restore-check)
+      printf 'RUN {\n'
+      channels_block
+      printf '  RESTORE SPFILE VALIDATE;\n'
+      printf '  RESTORE CONTROLFILE VALIDATE;\n'
+      printf '  RESTORE DATABASE VALIDATE CHECK LOGICAL;\n'
+      printf '}\n'
+      ;;
+    preview)
+      printf 'RESTORE DATABASE PREVIEW SUMMARY;\n'
+      ;;
+    maintenance)
+      printf 'CROSSCHECK BACKUP;\n'
+      printf 'CROSSCHECK ARCHIVELOG ALL;\n'
+      printf 'LIST EXPIRED BACKUP SUMMARY;\n'
+      printf 'REPORT OBSOLETE %s;\n' "$(retention_clause)"
+      if (( DELETE )); then
+        printf 'DELETE NOPROMPT EXPIRED BACKUP;\n'
+        printf 'DELETE NOPROMPT EXPIRED ARCHIVELOG ALL;\n'
+        printf 'DELETE NOPROMPT OBSOLETE %s;\n' "$(retention_clause)"
+      fi
+      ;;
+  esac
+  printf 'EXIT;\n'
+}
+
+# ---- environment -------------------------------------------------------------
+setup_oracle_env() {
+  [[ -n $OHOME ]] || die "ORACLE_HOME not set (use --oracle-home)"
+  [[ $OHOME == /* && -d $OHOME ]] || die "ORACLE_HOME $OHOME is not a directory"
+  RMAN="$OHOME/bin/rman"
+  [[ -x $RMAN ]] || die "rman not found at $RMAN"
+  export ORACLE_HOME="$OHOME" ORACLE_SID="$SID"
+  export PATH="$OHOME/bin:/usr/bin:/bin"
+  export NLS_DATE_FORMAT="YYYY-MM-DD HH24:MI:SS" NLS_LANG="AMERICAN_AMERICA.AL32UTF8"
+  # A remote connect identifier would redirect "CONNECT TARGET /" - always back up the local SID.
+  unset TWO_TASK LOCAL
+}
+
+setup_logging() {
+  if [[ -z $LOG_DIR ]]; then
+    if [[ -n ${ORACLE_BASE:-} ]]; then
+      LOG_DIR="$ORACLE_BASE/admin/$SID/rman_logs"
+    else
+      LOG_DIR="${HOME:?}/rman_logs"
+    fi
+  fi
+  mkdir -p -- "$LOG_DIR" 2>/dev/null || die "cannot create log directory $LOG_DIR"
+  [[ -w $LOG_DIR ]] || die "log directory $LOG_DIR is not writable"
+  LOG_FILE="$LOG_DIR/${PROG}_${SID}_${ACTION}_$(date +%Y%m%dT%H%M%S).log"
+  [[ -n $LOCK_FILE ]] || LOCK_FILE="$LOG_DIR/.${PROG}-${SID}.lock"
+}
+
+acquire_lock() {
+  command -v flock >/dev/null || die "flock (util-linux) is required"
+  exec 9>>"$LOCK_FILE" || die "cannot open lock file $LOCK_FILE"
+  flock -n 9 || die "another $PROG run for $SID holds $LOCK_FILE"
+}
+
+prune_logs() {
+  (( LOG_KEEP_DAYS > 0 )) || return 0
+  find "$LOG_DIR" -maxdepth 1 -type f -name "${PROG}_${SID}_*.log" -mtime "+$LOG_KEEP_DAYS" -delete 2>/dev/null || true
+}
+
+log() { printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >>"$LOG_FILE"; }
+
+# ---- result evaluation ---------------------------------------------------------
+# Sets STATUS/RC/MESSAGE/ERRORS from the RMAN exit code and log contents.
+evaluate() {
+  local rman_rc=$1
+  ERRORS=$(grep -oE '\b(RMAN|ORA)-[0-9]{5}\b' "$LOG_FILE" | sort -u | grep -vE '^RMAN-0(0558|0571|0569)$' | paste -sd, - || true)
+  if (( rman_rc == 124 || rman_rc == 137 )) && [[ -n $MAX_RUNTIME ]]; then
+    STATUS=CRITICAL RC=$E_CRIT MESSAGE="RMAN aborted after --max-runtime ${MAX_RUNTIME} min"
+  elif (( rman_rc != 0 )) || grep -q 'RMAN-00569' "$LOG_FILE"; then
+    STATUS=CRITICAL RC=$E_CRIT MESSAGE="RMAN failed (exit $rman_rc)"
+  elif grep -qE '^[[:space:]]*[0-9]+[[:space:]]+FAILED[[:space:]]' "$LOG_FILE"; then
+    STATUS=CRITICAL RC=$E_CRIT MESSAGE="corrupt blocks found by VALIDATE"
+  elif grep -qE 'RMAN-0(8137|8120|6207|6208|6210|6211)' "$LOG_FILE"; then
+    STATUS=WARNING RC=$E_WARN MESSAGE="completed with warnings"
+  else
+    STATUS=OK RC=$E_OK MESSAGE="completed"
+  fi
+}
+
+summary() {
+  local duration=$1
+  if [[ $FORMAT == json ]]; then
+    printf '{"tool":"oracle-rman-backup","version":%s,"action":%s,"sid":%s,"tag":%s,' \
+      "$(json_str "$VERSION")" "$(json_str "$ACTION")" "$(json_str "$SID")" "$(json_str "$TAG")"
+    printf '"status":%s,"exit_code":%d,"message":%s,"duration_s":%d,"log_file":%s,"errors":[' \
+      "$(json_str "$STATUS")" "$RC" "$(json_str "$MESSAGE")" "$duration" "$(json_str "$LOG_FILE")"
+    local first=1 code
+    local -a codes=()
+    IFS=, read -ra codes <<<"${ERRORS:-}"
+    for code in "${codes[@]}"; do
+      (( first )) || printf ','
+      json_str "$code"
+      first=0
+    done
+    printf ']}\n'
+  else
+    printf '%s - %s %s of %s %s in %ss (tag %s)%s, log: %s\n' "$STATUS" "$ACTION" \
+      "$( [[ $ACTION == full || $ACTION == incr || $ACTION == arch ]] && echo backup || echo run)" \
+      "$SID" "$MESSAGE" "$duration" "$TAG" "${ERRORS:+, codes: $ERRORS}" "$LOG_FILE"
+  fi
+}
+
+main() {
+  parse_args "$@"
+  [[ $FORMAT == json ]] || print_banner
+  validate_args
+  if (( DRY_RUN )); then
+    generate_script
+    exit "$E_OK"
+  fi
+  (( EUID != 0 )) || die "refusing to run as root: run as the Oracle software owner (e.g. oracle)"
+  setup_oracle_env
+
+  local tmpdir cmdfile
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/${PROG}.XXXXXX")
+  trap 'rm -rf -- "$tmpdir"' EXIT
+  cmdfile="$tmpdir/backup.rman"
+  generate_script >"$cmdfile"
+
+  if (( CHECK_SYNTAX )); then
+    if "$RMAN" checksyntax cmdfile="$cmdfile" >"$tmpdir/syntax.out" 2>&1; then
+      echo "OK - RMAN syntax check passed"
+      exit "$E_OK"
+    fi
+    cat "$tmpdir/syntax.out" >&2
+    die "RMAN syntax check failed" "$E_CRIT"
+  fi
+
+  setup_logging
+  acquire_lock
+  prune_logs
+  log INFO "$PROG $VERSION start: action=$ACTION sid=$SID tag=$TAG"
+  { echo "---- RMAN script ----"; cat "$cmdfile"; echo "---------------------"; } >>"$LOG_FILE"
+
+  local start rc=0
+  start=$(date +%s)
+  local -a cmd=("$RMAN" "cmdfile=$cmdfile" msgno)
+  [[ -z $MAX_RUNTIME ]] || cmd=(timeout --signal=TERM --kill-after=120 "$((MAX_RUNTIME * 60))" "${cmd[@]}")
+  "${cmd[@]}" </dev/null >>"$LOG_FILE" 2>&1 || rc=$?
+  local duration=$(($(date +%s) - start))
+
+  evaluate "$rc"
+  log "$STATUS" "$MESSAGE (rman exit $rc, ${duration}s)${ERRORS:+ codes: $ERRORS}"
+  summary "$duration"
+  exit "$RC"
+}
+
+main "$@"

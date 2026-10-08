@@ -1,0 +1,11 @@
+List of Datafiles
+=================
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+1    OK     0              18364        112640          2457012
+4    FAILED 0              1201         6400            2457005
+  File Name: /u01/oradata/FREE/users01.dbf
+  Block Type Blocks Failing Blocks Processed
+  ---------- -------------- ----------------
+  Data       0              3200
+  Index      2              900

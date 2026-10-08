@@ -1,0 +1,24 @@
+# /etc/systemd/system/oracle-rman-backup@.service
+# Instance name = action, e.g. oracle-rman-backup@full.service
+[Unit]
+Description=Oracle RMAN %i backup (oracle-rman-backup)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=oracle
+Group=oinstall
+Environment=ORACLE_SID=ORCL
+Environment=ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
+Environment=ORACLE_BASE=/u01/app/oracle
+Environment=NO_BANNER=1
+ExecStart=/usr/local/bin/oracle-rman-backup %i --channels 2 --compress --dest /u02/backup/ORCL --max-runtime 360
+# Hardening that does not get in RMAN's way
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

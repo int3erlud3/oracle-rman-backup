@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Mock rman for the bats tests: records its arguments and the command file, prints
+# canned output and exits with a configurable code.
+#   MOCK_RMAN_RECORD  directory for args/cmdfile/env copies (required)
+#   MOCK_RMAN_OUTPUT  file whose content is printed as RMAN output (optional)
+#   MOCK_RMAN_EXIT    exit code (default 0)
+#   MOCK_RMAN_SLEEP   seconds to sleep before exiting (default 0)
+set -euo pipefail
+: "${MOCK_RMAN_RECORD:?}"
+printf '%s\n' "$@" >"$MOCK_RMAN_RECORD/args"
+for arg in "$@"; do
+  case $arg in
+    cmdfile=*) cp -- "${arg#cmdfile=}" "$MOCK_RMAN_RECORD/cmdfile" ;;
+  esac
+done
+{
+  echo "ORACLE_SID=${ORACLE_SID:-}"
+  echo "ORACLE_HOME=${ORACLE_HOME:-}"
+  echo "TWO_TASK=${TWO_TASK:-}"
+  echo "NLS_DATE_FORMAT=${NLS_DATE_FORMAT:-}"
+} >"$MOCK_RMAN_RECORD/env"
+echo
+echo "Recovery Manager: Release 19.0.0.0.0 - Production"
+if [[ -n ${MOCK_RMAN_OUTPUT:-} ]]; then
+  cat -- "$MOCK_RMAN_OUTPUT"
+fi
+sleep "${MOCK_RMAN_SLEEP:-0}"
+echo "Recovery Manager complete."
+exit "${MOCK_RMAN_EXIT:-0}"

@@ -1,0 +1,11 @@
+# crontab of the oracle user (crontab -e). Output goes to the log directory;
+# stdout carries a one-line status that cron mails only if MAILTO is set.
+ORACLE_SID=ORCL
+ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
+ORACLE_BASE=/u01/app/oracle
+# m  h  dom mon dow  command
+0    1  *   *   0    /usr/local/bin/oracle-rman-backup full  --channels 2 --compress --dest /u02/backup/ORCL
+0    1  *   *   1-6  /usr/local/bin/oracle-rman-backup incr  --channels 2 --compress --dest /u02/backup/ORCL
+15   *  *   *   *    /usr/local/bin/oracle-rman-backup arch  --compress --dest /u02/backup/ORCL
+30   6  *   *   *    /usr/local/bin/oracle-rman-backup maintenance --retention-days 14 --delete
+0    3  *   *   6    /usr/local/bin/oracle-rman-backup restore-check
